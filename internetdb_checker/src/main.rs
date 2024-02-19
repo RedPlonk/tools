@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use trust_dns_resolver::TokioAsyncResolver;
+use uuid::Uuid;
+use bs58;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 struct InternetDBResponse {
@@ -16,24 +18,30 @@ struct InternetDBResponse {
 }
 
 impl InternetDBResponse {
-    fn display(&self) {
+    fn display(&self, uuid: &str) {
+        println!("UUID: {}", uuid);
         println!("IP Address: {}", self.ip);
-        println!("CPEs: {}", self.cpes.as_ref().map_or_else(|| "None".to_string(), |c| c.join(", ")));
-        println!("Hostnames: {}", self.hostnames.as_ref().map_or_else(|| "None".to_string(), |h| h.join(", ")));
-        println!("Ports: {}", self.ports.as_ref().map_or_else(|| "None".to_string(), |p| p.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
-        println!("Tags: {}", self.tags.as_ref().map_or_else(|| "None".to_string(), |t| t.join(", ")));
-        println!("Vulnerabilities: {}", self.vulns.as_ref().map_or_else(|| "None".to_string(), |v| v.join(", ")));
+        // Further implementation...
     }
 }
 
-async fn fetch_and_update_db(conn: &Connection, ip: &str) -> Result<(), Box<dyn Error>> {
+async fn fetch_and_update_db(conn: &Connection, ip: &str) -> Result<String, Box<dyn Error>> {
     let url = format!("https://internetdb.shodan.io/{}", ip);
-    let response: InternetDBResponse = reqwest::get(url).await?.json().await?;
-    
+    let response: InternetDBResponse = reqwest::get(&url).await?.json().await?;
+    let uuid = Uuid::new_v4();
+    let uuid_b58 = bs58::encode(uuid.as_bytes()).into_string();
+
     conn.execute(
-        "INSERT OR REPLACE INTO internetdb (ip, cpes, hostnames, ports, tags, vulns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO internetdb (uuid, ip, cpes, hostnames, ports, tags, vulns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(ip) DO UPDATE SET
+         cpes=excluded.cpes,
+         hostnames=excluded.hostnames,
+         ports=excluded.ports,
+         tags=excluded.tags,
+         vulns=excluded.vulns",
         params![
+            &uuid_b58,
             &response.ip,
             &serde_json::to_string(&response.cpes)?,
             &serde_json::to_string(&response.hostnames)?,
@@ -42,21 +50,22 @@ async fn fetch_and_update_db(conn: &Connection, ip: &str) -> Result<(), Box<dyn 
             &serde_json::to_string(&response.vulns)?,
         ],
     )?;
-    
-    response.display();
-    Ok(())
+
+    Ok(uuid_b58)
 }
 
 async fn process_address(conn: &Connection, address: &str) -> Result<(), Box<dyn Error>> {
-    let resolver = TokioAsyncResolver::tokio_from_system_conf()?; // Correction applied here
+    let resolver = TokioAsyncResolver::tokio_from_system_conf()?;
     match resolver.lookup_ip(address).await {
         Ok(lookup) => {
             for ip in lookup.iter() {
-                fetch_and_update_db(conn, &ip.to_string()).await?;
+                let uuid_b58 = fetch_and_update_db(conn, &ip.to_string()).await?;
+                println!("Processed IP: {} with UUID: {}", ip, uuid_b58);
             }
         },
         Err(_) => {
-            fetch_and_update_db(conn, address).await?;
+            let uuid_b58 = fetch_and_update_db(conn, address).await?;
+            println!("Processed address: {} with UUID: {}", address, uuid_b58);
         }
     }
 
@@ -72,24 +81,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("Invalid arguments".into());
     }
 
-    let refresh_flag = args[1] == "--refresh";
-    let addresses = if refresh_flag { &args[2..] } else { &args[1..] };
-
     let conn = Connection::open("internetdb.db")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS internetdb (
-            ip TEXT PRIMARY KEY,
+            uuid TEXT PRIMARY KEY,
+            ip TEXT UNIQUE,
             cpes TEXT,
             hostnames TEXT,
             ports TEXT,
             tags TEXT,
             vulns TEXT
         )",
-        params![],
+        [],
     )?;
 
+    let refresh_flag = args[1] == "--refresh";
+    let addresses = if refresh_flag { &args[2..] } else { &args[1..] };
+
     for address in addresses {
-        println!("Queued: {}", address);
         process_address(&conn, address).await?;
     }
 
