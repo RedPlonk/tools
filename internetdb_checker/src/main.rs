@@ -1,14 +1,15 @@
 use reqwest;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
+use trust_dns_resolver::TokioAsyncResolver;
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 struct InternetDBResponse {
     cpes: Option<Vec<String>>,
     hostnames: Option<Vec<String>>,
-    ip: Option<String>,
+    ip: String,
     ports: Option<Vec<u16>>,
     tags: Option<Vec<String>>,
     vulns: Option<Vec<String>>,
@@ -16,68 +17,65 @@ struct InternetDBResponse {
 
 impl InternetDBResponse {
     fn display(&self) {
-        println!("IP Address: {}", self.ip.as_ref().unwrap_or(&"Unknown IP".to_string()));
-        println!("CPEs: {}", self.cpes.as_ref().map_or(String::new(), |c| c.join(", ")));
-        println!("Hostnames: {}", self.hostnames.as_ref().map_or(String::new(), |h| h.join(", ")));
-        println!("Ports: {}", self.ports.as_ref().map_or(String::new(), |p| p.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
-        println!("Tags: {}", self.tags.as_ref().map_or(String::new(), |t| t.join(", ")));
-        println!("Vulnerabilities: {}", self.vulns.as_ref().map_or(String::new(), |v| v.join(", ")));
+        println!("IP Address: {}", self.ip);
+        println!("CPEs: {}", self.cpes.as_ref().map_or_else(|| "None".to_string(), |c| c.join(", ")));
+        println!("Hostnames: {}", self.hostnames.as_ref().map_or_else(|| "None".to_string(), |h| h.join(", ")));
+        println!("Ports: {}", self.ports.as_ref().map_or_else(|| "None".to_string(), |p| p.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+        println!("Tags: {}", self.tags.as_ref().map_or_else(|| "None".to_string(), |t| t.join(", ")));
+        println!("Vulnerabilities: {}", self.vulns.as_ref().map_or_else(|| "None".to_string(), |v| v.join(", ")));
     }
 }
 
-async fn fetch_and_update_db(conn: &Connection, ip_address: &str) -> Result<(), Box<dyn Error>> {
-    let url = format!("https://internetdb.shodan.io/{}", ip_address);
-    let response: InternetDBResponse = reqwest::get(&url).await?.json().await?;
+async fn fetch_and_update_db(conn: &Connection, ip: &str) -> Result<(), Box<dyn Error>> {
+    let url = format!("https://internetdb.shodan.io/{}", ip);
+    let response: InternetDBResponse = reqwest::get(url).await?.json().await?;
     
-    if let Some(ip) = &response.ip {
-        conn.execute(
-            "INSERT OR REPLACE INTO internetdb (ip, cpes, hostnames, ports, tags, vulns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                ip,
-                &serde_json::to_string(&response.cpes.as_ref().unwrap_or(&vec![]))?,
-                &serde_json::to_string(&response.hostnames.as_ref().unwrap_or(&vec![]))?,
-                &serde_json::to_string(&response.ports.as_ref().unwrap_or(&vec![]))?,
-                &serde_json::to_string(&response.tags.as_ref().unwrap_or(&vec![]))?,
-                &serde_json::to_string(&response.vulns.as_ref().unwrap_or(&vec![]))?,
-            ],
-        )?;
-    }
+    conn.execute(
+        "INSERT OR REPLACE INTO internetdb (ip, cpes, hostnames, ports, tags, vulns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &response.ip,
+            &serde_json::to_string(&response.cpes)?,
+            &serde_json::to_string(&response.hostnames)?,
+            &serde_json::to_string(&response.ports)?,
+            &serde_json::to_string(&response.tags)?,
+            &serde_json::to_string(&response.vulns)?,
+        ],
+    )?;
     
     response.display();
     Ok(())
 }
 
-fn lookup_ip_address(conn: &Connection, ip_address: &str) -> Result<Option<InternetDBResponse>, Box<dyn Error>> {
-    let mut stmt = conn.prepare("SELECT ip, cpes, hostnames, ports, tags, vulns FROM internetdb WHERE ip = ?1")?;
-    let mut rows = stmt.query(params![ip_address])?;
-
-    if let Some(row) = rows.next()? {
-        let response = InternetDBResponse {
-            ip: row.get(0)?,
-            cpes: serde_json::from_str(&row.get::<_, String>(1)?)?,
-            hostnames: serde_json::from_str(&row.get::<_, String>(2)?)?,
-            ports: serde_json::from_str(&row.get::<_, String>(3)?)?,
-            tags: serde_json::from_str(&row.get::<_, String>(4)?)?,
-            vulns: serde_json::from_str(&row.get::<_, String>(5)?)?,
-        };
-        Ok(Some(response))
-    } else {
-        Ok(None)
+async fn process_address(conn: &Connection, address: &str) -> Result<(), Box<dyn Error>> {
+    let resolver = TokioAsyncResolver::tokio_from_system_conf()?; // Correction applied here
+    match resolver.lookup_ip(address).await {
+        Ok(lookup) => {
+            for ip in lookup.iter() {
+                fetch_and_update_db(conn, &ip.to_string()).await?;
+            }
+        },
+        Err(_) => {
+            fetch_and_update_db(conn, address).await?;
+        }
     }
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 || args.len() > 3 || (args.len() == 3 && args[1] != "--refresh") {
-        eprintln!("Usage: {} [--refresh] <IP Address>", args[0]);
-        std::process::exit(1);
+
+    if args.len() < 2 {
+        eprintln!("Usage: {} [--refresh] <IP Address/FQDN>...", args[0]);
+        return Err("Invalid arguments".into());
     }
 
-    let ip_address = if args.contains(&"--refresh".to_string()) { &args[2] } else { &args[1] };
-    let conn = Connection::open("internetdb.db")?;
+    let refresh_flag = args[1] == "--refresh";
+    let addresses = if refresh_flag { &args[2..] } else { &args[1..] };
 
+    let conn = Connection::open("internetdb.db")?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS internetdb (
             ip TEXT PRIMARY KEY,
@@ -87,25 +85,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tags TEXT,
             vulns TEXT
         )",
-        [],
+        params![],
     )?;
 
-    if args.contains(&"--refresh".to_string()) {
-        fetch_and_update_db(&conn, ip_address).await?;
-    } else {
-        match lookup_ip_address(&conn, ip_address) {
-            Ok(Some(response)) => {
-                println!("Cached data found:");
-                response.display();
-            },
-            Ok(None) => {
-                println!("No cached data found. Fetching new data...");
-                fetch_and_update_db(&conn, ip_address).await?;
-            },
-            Err(e) => return Err(e),
-        }
+    for address in addresses {
+        println!("Queued: {}", address);
+        process_address(&conn, address).await?;
     }
 
     Ok(())
 }
-
