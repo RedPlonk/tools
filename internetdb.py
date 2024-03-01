@@ -3,12 +3,12 @@ import requests
 import sqlite3
 import socket
 import uuid
-import re
 import os
 import textwrap
-from datetime import datetime, timedelta
+from datetime import datetime
 from base58 import b58encode, b58decode
 from prettytable import PrettyTable
+import re # RegEx
 
 def is_valid_uuid58(uuid_str):
     try:
@@ -22,7 +22,7 @@ def generate_uuid58():
 
 def resolve_host_to_ip(host):
     try:
-        return socket.gethostbyname(host)
+        return [ip[4][0] for ip in socket.getaddrinfo(host, None)]
     except socket.gaierror:
         print(f"Could not resolve {host}")
         exit(1)
@@ -60,31 +60,25 @@ def create_or_connect_database():
                       )''')
     return conn
 
-def store_or_update_data_in_db(conn, data, identifier, reverse_dns):
+def store_or_update_data_in_db(conn, data, hostname, ip_address, reverse_dns):
     cursor = conn.cursor()
     current_mjd = datetime_to_mjd(datetime.utcnow())
-    cursor.execute("SELECT uuid FROM internetdb_cache WHERE ip = ? OR hostnames LIKE ?", (data['ip'], f"%{identifier}%"))
-    existing_uuid = cursor.fetchone()
-    
-    if existing_uuid:
-        uuid58 = existing_uuid[0]
-    else:
-        uuid58 = generate_uuid58()
+    uuid58 = generate_uuid58()
 
     cursor.execute('''REPLACE INTO internetdb_cache (uuid, ip, reverse_dns, ports, cpes, hostnames, tags, vulns, timestamp)
                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
                           uuid58,
-                          data.get('ip', ''),
+                          ip_address,
                           reverse_dns,
                           ','.join(map(str, data.get('ports', []))),
                           ','.join(data.get('cpes', [])),
-                          ','.join(data.get('hostnames', [])),
+                          hostname,
                           ','.join(data.get('tags', [])),
                           ','.join(data.get('vulns', [])),
                           current_mjd
                       ))
     conn.commit()
-    print(f"Data stored/updated with UUID58: {uuid58}")
+    print(f"Data for {ip_address} stored/updated with UUID58: {uuid58}")
 
 def wrap_text(text, width):
     return '\n'.join(textwrap.wrap(text, width))
@@ -95,50 +89,40 @@ def get_terminal_width():
     except OSError:
         return 80
 
-def display_data_from_db(conn, identifier, ip_address=None):
+def display_data_from_db(conn, identifier):
     cursor = conn.cursor()
-    query = "SELECT uuid, ip, reverse_dns, ports, cpes, hostnames, tags, vulns, timestamp FROM internetdb_cache WHERE ip = ? OR hostnames LIKE ?"
-    cursor.execute(query, (ip_address if ip_address else identifier, f"%{identifier}%"))
+    query = "SELECT uuid, ip, reverse_dns, ports, cpes, hostnames, tags, vulns, timestamp FROM internetdb_cache WHERE hostnames = ?"
+    cursor.execute(query, (identifier,))
     rows = cursor.fetchall()
 
     if rows:
         terminal_width = get_terminal_width()
-        column_width = max(20, terminal_width // 9)  # Adjust for new column
+        column_width = max(20, terminal_width // 9)
 
         table = PrettyTable()
         table.field_names = ["UUID58", "IP", "Reverse DNS", "Ports", "CPES", "Hostnames", "Tags", "Vulns", "Timestamp"]
         for row in rows:
             row = list(row)
-            # Convert MJD back to a readable date
             row[-1] = datetime.fromordinal(int(row[-1] + 2400000.5 - 1721424.5)).strftime('%Y-%m-%d')
             wrapped_row = [wrap_text(str(col), column_width) for col in row]
             table.add_row(wrapped_row)
 
         print(table)
-        return True
-    return False
+    else:
+        print(f"No data found for {identifier}")
 
 def refresh_or_fetch_data(conn, identifier, force_refresh=False):
-    ip_address = resolve_host_to_ip(identifier) if not is_valid_uuid58(identifier) and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", identifier) else identifier
-    reverse_dns = check_reverse_dns(ip_address) if not is_valid_uuid58(identifier) else "N/A"
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT timestamp FROM internetdb_cache WHERE ip = ? OR hostnames LIKE ?", (ip_address, f"%{identifier}%"))
-    row = cursor.fetchone()
-    if row:
-        timestamp = row[0]
-        current_mjd = datetime_to_mjd(datetime.utcnow())
-        if current_mjd - timestamp > 7 or force_refresh:  # More than a week old
-            print("Data is more than a week old or refresh forced. Fetching data from InternetDB...")
-            data = fetch_internetdb_data(ip_address)
-            store_or_update_data_in_db(conn, data, identifier, reverse_dns)
-        else:
-            print("Data retrieved from local cache.")
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", identifier):
+        ip_addresses = resolve_host_to_ip(identifier)
     else:
-        print("Fetching data from InternetDB...")
+        ip_addresses = [identifier]
+
+    for ip_address in ip_addresses:
+        reverse_dns = check_reverse_dns(ip_address) if ip_address == identifier else "N/A"
         data = fetch_internetdb_data(ip_address)
-        store_or_update_data_in_db(conn, data, identifier, reverse_dns)
-    display_data_from_db(conn, identifier, ip_address=ip_address)
+        store_or_update_data_in_db(conn, data, identifier, ip_address, reverse_dns)
+
+    display_data_from_db(conn, identifier)
 
 def main():
     parser = argparse.ArgumentParser(description="Cache InternetDB data.")
