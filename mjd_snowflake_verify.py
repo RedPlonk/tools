@@ -19,13 +19,6 @@ def generate_crc8_table(poly):
         table[byte] = crc
     return table
 
-def crc8(data, table):
-    """Calculate CRC-8 for the given data using a specified table."""
-    crc = 0x00
-    for byte in data:
-        crc = table[(crc ^ byte) & 0xFF]
-    return crc
-
 def base58_encode(num):
     """Encode a number in Base58."""
     encode = ''
@@ -45,7 +38,6 @@ class SnowflakeGenerator:
     def __init__(self, poly):
         self.sequence = 0
         self.last_timestamp = -1
-        self.poly = poly
         self.table = generate_crc8_table(poly)
 
     def current_mjd(self):
@@ -55,8 +47,8 @@ class SnowflakeGenerator:
         mjd = (now - jd_ref).days + (now.hour * 3600 + now.minute * 60 + now.second) / 86400
         return int(mjd * 86400000)
 
-    def generate_id(self, data):
-        """Generates a custom Snowflake ID with CRC-8 as a checksum."""
+    def generate_id(self):
+        """Generates a custom Snowflake ID, bit shifts to add CRC-8 checksum."""
         timestamp = self.current_mjd()
         if timestamp != self.last_timestamp:
             self.sequence = 0
@@ -65,19 +57,35 @@ class SnowflakeGenerator:
             self.sequence += 1
             if self.sequence >= (1 << 15):
                 raise Exception("Sequence overflow. Wait for next millisecond.")
-        
+
+        # Generate the Snowflake ID without the CRC-8
         snowflake_id = (timestamp << 15) | self.sequence
-        crc = crc8(snowflake_id.to_bytes(8, byteorder="big"), self.table)
-        final_id = (crc << (64 - 8)) | snowflake_id
+        
+        # Calculate CRC-8 for the Snowflake ID
+        crc = self.calculate_crc8(snowflake_id.to_bytes(8, byteorder="big"))
+        
+        # Bit shift the Snowflake ID to the left by 8 bits to make space for CRC-8
+        shifted_id = snowflake_id << 8
+        
+        # Append CRC-8 in the least significant bits of the shifted ID
+        final_id = shifted_id | crc
+        
         return crc, snowflake_id, final_id
+
+    def calculate_crc8(self, data):
+        """Calculate CRC-8 for the given data using the specified table."""
+        crc = 0x00
+        for byte in data:
+            crc = self.table[(crc ^ byte) & 0xFF]
+        return crc
 
 def verify_id(final_id_base58, poly):
     """Verifies the integrity of the final ID by comparing CRC-8 checksums."""
     final_id = base58_decode(final_id_base58)
-    extracted_crc = final_id >> (64 - 8)
-    snowflake_id = final_id & ((1 << (64 - 8)) - 1)
-    table = generate_crc8_table(poly)
-    recalculated_crc = crc8(snowflake_id.to_bytes(8, byteorder="big"), table)
+    generator = SnowflakeGenerator(poly)
+    extracted_crc = final_id & 0xFF
+    snowflake_id = final_id >> 8
+    recalculated_crc = generator.calculate_crc8(snowflake_id.to_bytes(8, byteorder="big"))
 
     if extracted_crc == recalculated_crc:
         print("Verification successful: The CRC-8 checksum matches.")
@@ -86,17 +94,15 @@ def verify_id(final_id_base58, poly):
         print("Verification failed: The CRC-8 checksum does not match.")
         return False
 
-def find_best_poly(snowflake_ids):
-    """Finds the best CRC-8 polynomial based on the snowflake IDs."""
+def find_best_poly():
+    """Finds the best CRC-8 polynomial based on randomly generated Snowflake IDs."""
     best_poly = None
     best_unique_crcs = 0
+    sample_snowflake_ids = [random.getrandbits(56) for _ in range(1000)]  # Adjust bit length for CRC-8
 
-    # Generate all possible 8-bit polynomials
-    polynomials = [0x01 + (i << 1) for i in range(128)]
-
-    for poly in polynomials:
-        table = generate_crc8_table(poly)
-        crc_values = set(crc8(sf_id.to_bytes(8, byteorder="big"), table) for sf_id in snowflake_ids)
+    for poly in range(256):
+        generator = SnowflakeGenerator(poly)
+        crc_values = set(generator.calculate_crc8(sf_id.to_bytes(8, byteorder="big")) for sf_id in sample_snowflake_ids)
         if len(crc_values) > best_unique_crcs:
             best_unique_crcs = len(crc_values)
             best_poly = poly
@@ -105,27 +111,22 @@ def find_best_poly(snowflake_ids):
     return best_poly
 
 def main():
-    # Set up argument parsing
     parser = argparse.ArgumentParser(description="Generate or verify a Snowflake ID with CRC-8.")
     parser.add_argument("--verify", type=str, help="Verify the specified Snowflake ID (Base58 encoded).")
-    parser.add_argument("--poly", type=lambda x: int(x, 0), help="Specify the CRC-8 polynomial in hex format (e.g., 0x07).", default=0x07)
+    parser.add_argument("--poly", type=lambda x: int(x, 0), help="Specify the CRC-8 polynomial in hex format.", default=0x07)
+    parser.add_argument("--find-best-poly", action="store_true", help="Find the best CRC-8 polynomial for Snowflake IDs.")
+    
     args = parser.parse_args()
 
-    if args.verify:
-        # Verify mode
+    if args.find_best_poly:
+        find_best_poly()
+    elif args.verify:
         verify_id(args.verify, args.poly)
     else:
-        # Generate mode
         generator = SnowflakeGenerator(args.poly)
-        machine_data = 'machine-1'
-        crc, snowflake_id, final_id = generator.generate_id(machine_data)
-        print(f"CRC-8 Checksum: {crc}")
-        print(f"Snowflake ID (without CRC-8): {snowflake_id}")
-        print(f"Final ID with CRC-8 prepended (Base58): {base58_encode(final_id)}")
-
-        # Polynomial search mode (demonstration with random Snowflake IDs)
-        snowflake_ids = [random.getrandbits(64) for _ in range(1000)]
-        find_best_poly(snowflake_ids)
+        _, snowflake_id, final_id = generator.generate_id()
+        print(f"Generated Snowflake ID: {snowflake_id}")
+        print(f"Final ID with CRC-8 appended (Base58): {base58_encode(final_id)}")
 
 if __name__ == "__main__":
     main()
