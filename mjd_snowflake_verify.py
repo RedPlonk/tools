@@ -60,11 +60,11 @@ class SnowflakeGenerator:
         jd_ref = datetime.datetime(1858, 11, 17)
         now = datetime.datetime.utcnow()
         mjd = (now - jd_ref).days + (now.hour * 3600 + now.minute * 60 + now.second) / 86400
-        return int(mjd * 86400000)
+        return int(mjd * 86400000), mjd
 
     def generate_id(self):
         """Generates a custom Snowflake ID with CRC-8 checksum and polynomial prepended."""
-        timestamp = self.current_mjd()
+        timestamp, mjd = self.current_mjd()
         if timestamp != self.last_timestamp:
             self.sequence = 0
             self.last_timestamp = timestamp
@@ -77,7 +77,7 @@ class SnowflakeGenerator:
         crc = self.calculate_crc8(snowflake_id.to_bytes(8, byteorder="big"))
         shifted_id = snowflake_id << 16  # Make space for CRC-8 and polynomial
         final_id = shifted_id | (self.poly << 8) | crc
-        return crc, snowflake_id, final_id
+        return crc, snowflake_id, final_id, mjd
 
     def calculate_crc8(self, data):
         """Calculate CRC-8 for the given data using the specified table."""
@@ -100,8 +100,11 @@ def verify_id(final_id_base58):
     generator = SnowflakeGenerator(extracted_poly)
     recalculated_crc = generator.calculate_crc8(snowflake_id.to_bytes(8, byteorder="big"))
 
+    mjd_timestamp = snowflake_id >> 47  # Adjust based on your Snowflake ID structure
+    mjd = datetime.datetime(1858, 11, 17) + datetime.timedelta(days=mjd_timestamp)
+
     if extracted_crc == recalculated_crc:
-        print("Verification successful: The CRC-8 checksum matches.")
+        print(f"Verification successful: The CRC-8 checksum matches. MJD: {mjd}")
         print(f"Verified with polynomial: 0x{extracted_poly:02X}")
         return True
     else:
@@ -123,8 +126,8 @@ def main():
         print(f"Using best polynomial: 0x{best_poly:02X}")
 
         generator = SnowflakeGenerator(best_poly)
-        _, snowflake_id, final_id = generator.generate_id()
-        print(f"Snowflake ID: {snowflake_id}")
+        crc, snowflake_id, final_id, mjd = generator.generate_id()
+        print(f"Snowflake ID: {snowflake_id} (MJD: {mjd})")
         print(f"Final ID with CRC-8 and poly prepended (Base58): {base58_encode(final_id)}")
         print(f"Used polynomial: 0x{best_poly:02X}")
 
