@@ -86,27 +86,44 @@ class SnowflakeGenerator:
             crc = self.table[(crc ^ byte) & 0xFF]
         return crc
 
+def extract_info_from_id(final_id):
+    """Extracts the polynomial, CRC, and Snowflake ID from the final numeric ID."""
+    extracted_crc = final_id & 0xFF
+    extracted_poly = (final_id >> 8) & 0xFF
+    snowflake_id = final_id >> 16
+    return extracted_poly, extracted_crc, snowflake_id
+
+def verify_id(final_id_base58):
+    """Verifies the integrity of the final ID by comparing CRC-8 checksums."""
+    final_id = base58_decode(final_id_base58)
+    extracted_poly, extracted_crc, snowflake_id = extract_info_from_id(final_id)
+    generator = SnowflakeGenerator(extracted_poly)
+    recalculated_crc = generator.calculate_crc8(snowflake_id.to_bytes(8, byteorder="big"))
+
+    if extracted_crc == recalculated_crc:
+        print("Verification successful: The CRC-8 checksum matches.")
+        print(f"Verified with polynomial: 0x{extracted_poly:02X}")
+        return True
+    else:
+        print("Verification failed: The CRC-8 checksum does not match.")
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description="Generate or verify a Snowflake ID with CRC-8.")
     parser.add_argument("--verify", type=str, help="Verify the specified Snowflake ID (Base58 encoded).")
-    parser.add_argument("--find-best-poly", action="store_true", help="Find the best CRC-8 polynomial for Snowflake IDs and use it.")
     
     args = parser.parse_args()
 
-    # Sample Snowflake IDs for finding the best polynomial
-    sample_snowflake_ids = [random.getrandbits(48) for _ in range(1000)]
-
-    if args.find_best_poly or not args.verify:
+    if args.verify:
+        verify_id(args.verify)
+    else:
+        # Generate sample Snowflake IDs to determine the best polynomial
+        sample_snowflake_ids = [random.getrandbits(48) for _ in range(1000)]
         best_poly = find_best_poly(sample_snowflake_ids)
         print(f"Using best polynomial: 0x{best_poly:02X}")
-    else:
-        best_poly = int(args.verify[:2], 16)  # Assuming the polynomial is prepended in the base58 encoded string
 
-    if args.verify:
-        verify_id(args.verify, best_poly)
-    else:
         generator = SnowflakeGenerator(best_poly)
-        crc, snowflake_id, final_id = generator.generate_id()
+        _, snowflake_id, final_id = generator.generate_id()
         print(f"Snowflake ID: {snowflake_id}")
         print(f"Final ID with CRC-8 and poly prepended (Base58): {base58_encode(final_id)}")
         print(f"Used polynomial: 0x{best_poly:02X}")
