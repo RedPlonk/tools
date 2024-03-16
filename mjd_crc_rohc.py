@@ -1,4 +1,5 @@
 import datetime
+import struct
 import base58
 
 def crc8_rohc(data):
@@ -11,7 +12,8 @@ def crc8_rohc(data):
                 crc = (crc << 1) ^ poly
             else:
                 crc <<= 1
-    return crc & 0xFF
+        crc &= 0xFF  # Ensure crc remains within 8 bits
+    return crc
 
 def calculate_mjd_with_decimal(year, month, day, hour, minute, second, fraction):
     if month <= 2:
@@ -21,44 +23,42 @@ def calculate_mjd_with_decimal(year, month, day, hour, minute, second, fraction)
     B = 2 - A + (A // 4)
     jd = int(365.25 * (year + 4716)) + int(30.6001 * (month + 1)) + day + B - 1524.5
     mjd = jd - 2400000.5
-    return mjd + fraction
+    # Convert hour, minute, and second to fractional day
+    day_fraction = (hour + minute / 60.0 + second / 3600.0) / 24.0
+    return mjd + day_fraction + fraction / 1e6  # Adjust for microsecond precision
 
 def main():
-    # Step 1: Calculate a Modified Julian Date (MJD) with decimal places
+    # Calculate a Modified Julian Date (MJD) with decimal places
     current_utc_datetime = datetime.datetime.utcnow()
-    current_mjd_fraction = current_utc_datetime.microsecond / 1e6
     current_mjd_with_decimal = calculate_mjd_with_decimal(current_utc_datetime.year, current_utc_datetime.month,
-                                                        current_utc_datetime.day, current_utc_datetime.hour,
-                                                        current_utc_datetime.minute, current_utc_datetime.second,
-                                                        current_mjd_fraction)
+                                                          current_utc_datetime.day, current_utc_datetime.hour,
+                                                          current_utc_datetime.minute, current_utc_datetime.second,
+                                                          current_utc_datetime.microsecond)
     print("MJD with Decimal:", current_mjd_with_decimal)
 
-    # Step 2: Calculate the CRC-8-ROHC value for the MJD
-    mjd_bytes = int(current_mjd_with_decimal).to_bytes(3, 'big')  # Assuming MJD is represented as a 24-bit integer
+    # Convert the MJD with decimal places to bytes
+    mjd_bytes = struct.pack('>f', current_mjd_with_decimal)
+
+    # Calculate the CRC-8-ROHC value for the MJD bytes
     crc8_rohc_value = crc8_rohc(mjd_bytes)
     print("CRC-8-ROHC Value:", crc8_rohc_value)
 
-    # Step 3: Convert the MJD and CRC-8-ROHC value into base58
-    encoded_mjd = base58.b58encode_int(int(current_mjd_with_decimal))
-    encoded_crc8_rohc = base58.b58encode_int(crc8_rohc_value)
+    # Encode the combined MJD and CRC-8-ROHC value into base58
+    combined_bytes = struct.pack('>fB', current_mjd_with_decimal, crc8_rohc_value)
+    combined_base58 = base58.b58encode(combined_bytes)
+    print("\nCombined Base58 Value:", combined_base58.decode())
 
-    # Step 4: Prepend the CRC-8-ROHC value to the MJD
-    combined_value = encoded_crc8_rohc + encoded_mjd
-    print("\nCombined Base58 Value:", combined_value)
-
-    # Step 5: Extract the CRC-8-ROHC value and the MJD from the combined base58 value
-    extracted_crc8_rohc = base58.b58decode_int(combined_value[:2])
-    extracted_mjd = base58.b58decode_int(combined_value[2:])
-
+    # Decode the combined value from base58
+    decoded_bytes = base58.b58decode(combined_base58)
+    extracted_mjd, extracted_crc8_rohc = struct.unpack('>fB', decoded_bytes)
     print("\nExtracted CRC-8-ROHC Value:", extracted_crc8_rohc)
     print("Extracted MJD:", extracted_mjd)
 
-    # Step 6: Calculate the CRC-8-ROHC value again for the extracted MJD
-    extracted_mjd_bytes = extracted_mjd.to_bytes(3, 'big')
-    recalculated_crc8_rohc = crc8_rohc(extracted_mjd_bytes)
+    # Recalculate the CRC-8-ROHC for verification
+    recalculated_crc8_rohc = crc8_rohc(struct.pack('>f', extracted_mjd))
     print("\nRecalculated CRC-8-ROHC Value:", recalculated_crc8_rohc)
 
-    # Step 7: Verify that the calculated CRC-8-ROHC value matches the extracted CRC-8-ROHC value
+    # Verify that the recalculated CRC-8-ROHC matches the extracted value
     verification_result = "Verification Passed" if recalculated_crc8_rohc == extracted_crc8_rohc else "Verification Failed"
     print("\nVerification Result:", verification_result)
 
